@@ -188,19 +188,28 @@ def load_generation_rows(meta: dict[str, Any]) -> list[dict[str, str]]:
 
 
 class CsvShardWriter:
-    def __init__(self, output_dir: Path, prefix: str, max_rows: int) -> None:
+    def __init__(self, output_dir: Path, prefix: str, max_rows: int, append_existing: bool = False) -> None:
         self.output_dir = output_dir
         self.prefix = prefix
         self.max_rows = max_rows if max_rows > 0 else 1000000000
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.part_idx = 0
+        self.part_idx = self._max_existing_part_idx() if append_existing else 0
         self.rows_in_part = 0
         self.total_rows = 0
         self.current_fields: list[str] = []
         self.current_file: Optional[TextIO] = None
         self.current_writer: Optional[csv.DictWriter] = None
         self.files_written: list[str] = []
+
+    def _max_existing_part_idx(self) -> int:
+        pattern = re.compile(rf"^{re.escape(self.prefix)}_part(\d+)\.csv$")
+        max_idx = 0
+        for path in self.output_dir.glob(f"{self.prefix}_part*.csv"):
+            match = pattern.match(path.name)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+        return max_idx
 
     def _next_path(self) -> Path:
         self.part_idx += 1
@@ -244,6 +253,26 @@ class CsvShardWriter:
 
     def close(self) -> None:
         self._close_current()
+
+
+def load_exported_dates(csv_dir: Path, prefix: str) -> set[str]:
+    dates: set[str] = set()
+    if not csv_dir.exists():
+        return dates
+
+    pattern = re.compile(rf"^{re.escape(prefix)}_part\d+\.csv$")
+    for path in sorted(csv_dir.glob(f"{prefix}_part*.csv")):
+        if not pattern.match(path.name) or not path.is_file():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    date_value = (row.get("date") or "").strip()
+                    if date_value:
+                        dates.add(date_value)
+        except Exception as e:
+            log(f"[WARN] Could not read existing CSV dates from {path}: {e}")
+    return dates
 
 
 def parse_markdown_table(text: str, warnings: Optional[list[dict[str, Any]]] = None) -> list[dict[str, str]]:
@@ -844,6 +873,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--csv-dir", default="", help="Optional output directory for chunked CSV export")
     p.add_argument("--csv-prefix", default="rivers", help="Filename prefix for CSV shards")
     p.add_argument("--max-csv-rows", type=int, default=5000, help="Maximum rows per CSV shard before rolling over")
+    p.add_argument(
+        "--only-missing-final-dates",
+        action="store_true",
+        help=(
+            "Process only source items whose bulletin_date is absent from --csv-dir/--csv-prefix shards. "
+            "Existing store-dir/csv_exports shards are ignored unless --csv-dir points there."
+        ),
+    )
+    p.add_argument(
+        "--append-csv",
+        action="store_true",
+        help="Start new CSV shards after existing --csv-prefix part files instead of overwriting part0001.",
+    )
     p.add_argument("--manifest", default="", help="Optional output manifest path")
     return p.parse_args()
 
@@ -865,7 +907,26 @@ def main() -> int:
 
     river_filters = {normalize_river_for_filter(x) for x in args.rivers if normalize_river_for_filter(x)}
     csv_dir = Path(args.csv_dir).expanduser().resolve() if args.csv_dir else (store_dir / "csv_exports")
-    csv_writer = CsvShardWriter(output_dir=csv_dir, prefix=args.csv_prefix, max_rows=args.max_csv_rows)
+
+    if args.only_missing_final_dates:
+        existing_dates = load_exported_dates(csv_dir=csv_dir, prefix=args.csv_prefix)
+        before_count = len(items)
+        items = [item for item in items if item.bulletin_date and item.bulletin_date not in existing_dates]
+        skipped_count = before_count - len(items)
+        log(
+            f"[MISSING-DATES] final_csv_dir={csv_dir} existing_dates={len(existing_dates)} "
+            f"selected={len(items)} skipped={skipped_count}"
+        )
+        if not items:
+            log("No missing final CSV dates to process.")
+            return 0
+
+    csv_writer = CsvShardWriter(
+        output_dir=csv_dir,
+        prefix=args.csv_prefix,
+        max_rows=args.max_csv_rows,
+        append_existing=args.append_csv or args.only_missing_final_dates,
+    )
 
     def export_rows_for_item(source: SourceItem, meta: dict[str, Any]) -> int:
         table_rows = load_generation_rows(meta)
